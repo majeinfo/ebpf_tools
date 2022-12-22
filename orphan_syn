@@ -1,0 +1,104 @@
+#!/usr/bin/python3.6
+import argparse
+import logging
+from collections import defaultdict
+from time import sleep
+from socket import ntohs, ntohl, inet_ntop, AF_INET
+from struct import pack
+from bcc import BPF, tcp
+
+# define BPF program
+bpf_text = """
+#include <net/sock.h>
+#include <net/inet_sock.h>
+#include <net/tcp_states.h>
+#include <uapi/linux/tcp.h>
+#include <uapi/linux/ip.h>
+
+struct tcp_data_t {
+    u32 saddr;
+    u32 daddr;
+    u16 sport;
+    u16 dport;
+    u64 state;
+};
+BPF_PERF_OUTPUT(tcp_events);
+
+int trace_tcp_retransmit_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb, int segs)
+{
+    bpf_trace_printk("retransmit\\n");
+
+    if (sk == NULL) return 0;
+
+    struct inet_sock *is = inet_sk(sk);
+
+    u32 pid = bpf_get_current_pid_tgid();
+    u16 family = sk->__sk_common.skc_family;
+    char state = sk->__sk_common.skc_state;
+
+    if (state != TCP_SYN_SENT) return 0;
+
+    struct tcp_data_t tcp_event = {};
+    tcp_event.saddr = sk->__sk_common.skc_rcv_saddr;
+    tcp_event.daddr = sk->__sk_common.skc_daddr;
+    tcp_event.dport = sk->__sk_common.skc_dport;
+    tcp_event.sport = is->inet_sport;
+    tcp_event.state = sk->__sk_common.skc_state;
+
+    tcp_events.perf_submit(ctx, &tcp_event, sizeof(tcp_event));
+
+    bpf_trace_printk("saddr=%lu, daddr=%lu\\n", tcp_event.saddr, tcp_event.daddr);
+    bpf_trace_printk("sport=%u, dport=%u\\n", tcp_event.sport, tcp_event.dport);
+    bpf_trace_printk("state=%u\\n", state);
+
+    return 0;
+};
+"""
+
+syn_sent_found = defaultdict(int)
+
+# process event
+def print_tcp_event(cpu, data, size):
+    event = b["tcp_events"].event(data)
+    cnx_id = f"{inet_ntop(AF_INET, pack('I', event.saddr))}:{ntohs(event.sport)}->{inet_ntop(AF_INET, pack('I', event.daddr))}:{ntohs(event.dport)}"
+    syn_sent_found[cnx_id] += 1
+    logging.debug(f"src={inet_ntop(AF_INET, pack('I', event.saddr))}:{ntohs(event.sport)}, "
+                 f"dst={inet_ntop(AF_INET, pack('I', event.daddr))}:{ntohs(event.dport)}")
+    #print(tcp.flags2str(event.state), event.state)
+    if syn_sent_found[cnx_id] > args.count:
+        logging.error(f"Too many retries for SYN: {cnx_id}")
+
+
+# Command line analysis
+parser = argparse.ArgumentParser(
+    description="Trace orphan TCP SYN",
+)
+parser.add_argument("-v", "--verbose", action="store_true", help="Set the verbose (debug) mode")
+parser.add_argument("-c", "--count", nargs="?", default=3, type=int, help="Minimum SYN_SENT retries before error")
+args = parser.parse_args()
+
+if args.verbose:
+    logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.DEBUG)
+else:
+    logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.INFO)
+
+# initialize BPF
+b = BPF(text=bpf_text)
+if b.get_kprobe_functions(b"tcp_retransmit_skb"):
+    b.attach_kprobe(event="tcp_retransmit_skb", fn_name="trace_tcp_retransmit_skb")
+else:
+    logging.error("ERROR: tcp_retransmit_skb() kernel function not found or traceable. "
+        "Older kernel versions not supported.")
+    exit()
+
+logging.debug("Tracing Orphan SYN ... Hit Ctrl-C to end")
+
+b["tcp_events"].open_perf_buffer(print_tcp_event)
+
+while True:
+    try:
+        logging.debug('poll')
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
+
